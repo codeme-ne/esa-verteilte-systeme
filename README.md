@@ -12,11 +12,10 @@
 1. [Projektübersicht](#projektübersicht)
 2. [Verteilte Systemkomponenten](#verteilte-systemkomponenten)
 3. [Fokus: Payment-Flow mit Webhook](#fokus-payment-flow-mit-webhook)
-4. [Architektur-Diagramm](#architektur-diagramm)
-5. [Implementierungsdetails](#implementierungsdetails)
-6. [Konzepte verteilter Programmierung](#konzepte-verteilter-programmierung)
+4. [Implementierungsdetails](#implementierungsdetails)
+5. [Konzepte verteilter Programmierung](#konzepte-verteilter-programmierung)
+6. [Quellcode-Struktur](#quellcode-struktur)
 7. [Installation & Ausführung](#installation--ausführung)
-8. [Quellcode-Struktur](#quellcode-struktur)
 
 ---
 
@@ -27,7 +26,7 @@ Die **Produktivitäts-Werkstatt** ist eine deutschsprachige Video-Kurs-Plattform
 - **Service-zu-Service Kommunikation** (HTTP/REST)
 - **Event-Driven Architecture** (Webhooks)
 - **Asynchrone Verarbeitung** (Email-Versand)
-- **Authentifizierung über Token** (JWT)
+- **Idempotenz-Handling** (Webhook-Deduplizierung)
 
 ---
 
@@ -36,16 +35,14 @@ Die **Produktivitäts-Werkstatt** ist eine deutschsprachige Video-Kurs-Plattform
 | Komponente | Kommunikationsart | Protokoll | Externe APIs |
 |------------|-------------------|-----------|--------------|
 | **Stripe Payment** | Synchron + Async (Webhook) | HTTPS/REST | Stripe API |
-| **Bunny.net Video** | Synchron REST | HTTPS/JSON | Bunny CDN API |
 | **Resend Email** | Synchron REST | HTTPS/JSON | Resend API |
-| **Magic Link Auth** | Multi-Step (Server→Email→Client) | HTTP + SMTP | Resend API |
 | **Client APIs** | Request/Response | HTTP/JSON | Intern |
 
 ---
 
 ## Fokus: Payment-Flow mit Webhook
 
-Die **Stripe Payment Integration** ist das beste Beispiel für verteilte Programmierung in diesem Projekt, da sie mehrere Konzepte kombiniert:
+Die **Stripe Payment Integration** ist das Hauptbeispiel für verteilte Programmierung in diesem Projekt, da sie mehrere Konzepte kombiniert:
 
 ### Sequenzdiagramm: Stripe Payment Flow
 
@@ -74,29 +71,12 @@ Die **Stripe Payment Integration** ist das beste Beispiel für verteilte Program
 
 | Konzept | Implementierung | Datei |
 |---------|-----------------|-------|
-| **Asynchrone Kommunikation** | Stripe sendet Webhook nach Zahlungsabschluss | `app/api/webhook/stripe/route.ts` |
+| **Asynchrone Kommunikation** | Stripe sendet Webhook nach Zahlungsabschluss | `src/app/api/webhook/stripe/route.ts` |
 | **At-least-once Delivery** | Stripe wiederholt bei HTTP-Fehlern | Stripe Retry-Policy |
-| **Idempotenz** | Webhook-Events werden dedupliziert | `reserveWebhookEvent()` |
+| **Idempotenz** | Webhook-Events werden dedupliziert | `src/libs/webhookStore.ts` |
 | **Signatur-Verifizierung** | HMAC-basierte Authentifizierung | `stripe.webhooks.constructEvent()` |
 | **Service-Orchestrierung** | Stripe → Server → Resend Email | Multi-Service-Flow |
 | **Error Handling** | HTTP 500 triggert Stripe-Retry | Try/Catch mit Status-Codes |
-
----
-
-## Architektur-Diagramm
-
-### Gesamtübersicht
-
-![Architektur-Übersicht](./mermaid_diagram_architechture.svg)
-
-### Komponenten
-
-| Schicht | Komponenten | Technologie |
-|---------|-------------|-------------|
-| **Frontend** | React App, JWT Cookie | Next.js 15, React 19 |
-| **Backend** | API Routes, Middleware | Next.js App Router |
-| **Externe Services** | Payment, Video, Email | Stripe, Bunny.net, Resend |
-| **Persistenz** | Progress, Releases | File-JSON / PostgreSQL |
 
 ---
 
@@ -104,15 +84,26 @@ Die **Stripe Payment Integration** ist das beste Beispiel für verteilte Program
 
 ### 1. Checkout-Session erstellen (Synchron)
 
-**Datei**: `app/api/stripe/create-checkout/route.ts`
+**Datei**: `src/app/api/stripe/create-checkout/route.ts`
 
 ```typescript
-// Vereinfachter Code-Ausschnitt
 export async function POST(req: Request) {
-  // Input-Validierung mit Zod
+  // 1. Rate-Limiting prüfen
+  const rate = await checkRateLimit({ key: `checkout:${ip}`, limit: 20, windowMs: 60_000 });
+  if (!rate.ok) {
+    return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 });
+  }
+
+  // 2. Input-Validierung mit Zod
+  const parsed = checkoutSchema.safeParse(body);
   const { successUrl, cancelUrl, productType } = parsed.data;
 
-  // Stripe API aufrufen (synchroner REST-Call)
+  // 3. Redirect-URL Validierung (Security)
+  if (!isAllowedRedirect(successUrl) || !isAllowedRedirect(cancelUrl)) {
+    return NextResponse.json({ error: "Redirect URLs not allowed" }, { status: 400 });
+  }
+
+  // 4. Stripe API aufrufen (synchroner REST-Call)
   const { createCheckout } = await import("@/libs/stripe");
   const url = await createCheckout({ successUrl, cancelUrl, productType });
 
@@ -120,32 +111,43 @@ export async function POST(req: Request) {
 }
 ```
 
-**Konzept**: Synchrone Request/Response-Kommunikation mit externer API
+**Konzepte**:
+- Synchrone Request/Response-Kommunikation
+- Input-Validierung (Zod Schema)
+- Rate-Limiting zum Schutz vor Missbrauch
+- URL-Whitelist gegen Open Redirect Attacks
 
 ### 2. Webhook-Handler (Asynchron)
 
-**Datei**: `app/api/webhook/stripe/route.ts`
+**Datei**: `src/app/api/webhook/stripe/route.ts`
 
 ```typescript
-// Vereinfachter Code-Ausschnitt
 export async function POST(req: NextRequest) {
-  // 1. Signatur verifizieren (Sicherheit)
+  // 1. Webhook-Secret prüfen
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    return NextResponse.json({ error: "Webhook secret not configured" }, { status: 500 });
+  }
+
+  // 2. Signatur verifizieren (HMAC-basierte Authentifizierung)
+  const body = await req.text();
+  const signature = headers().get("stripe-signature");
   const event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
 
-  // 2. Idempotenz prüfen (At-least-once → Exactly-once)
+  // 3. Idempotenz prüfen (At-least-once → Exactly-once)
   const reserved = await reserveWebhookEvent(event.id);
   if (!reserved) {
     return NextResponse.json({ ok: true, duplicate: true });
   }
 
-  // 3. Email senden (Service-Orchestrierung)
+  // 4. Business-Logik: Email senden
   await sendEmail({
     to: email,
     subject: welcomeEmailSubject,
     html: welcomeEmail(magicLink),
   });
 
-  // 4. Verarbeitung markieren
+  // 5. Event als verarbeitet markieren
   await markWebhookProcessed(event.id);
 
   return NextResponse.json({ ok: true });
@@ -153,42 +155,69 @@ export async function POST(req: NextRequest) {
 ```
 
 **Konzepte**:
-- Event-Driven Architecture
-- Idempotenz-Handling
+- Event-Driven Architecture (Push-Modell)
 - Kryptographische Signatur-Verifizierung
+- Idempotenz-Handling (3-Phasen: Reserve → Process → Mark)
 - Multi-Service-Orchestrierung
 
-### 3. Bunny.net Video-API (REST)
+### 3. Idempotenz-Store
 
-**Datei**: `libs/bunnyStream.ts`
+**Datei**: `src/libs/webhookStore.ts`
 
 ```typescript
-// REST-Client mit Timeout und Retry-Logik
-export async function getVideoMeta(libraryId: string, guid: string) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+// Dual-Storage: PostgreSQL in Production, File-basiert in Development
+const hasDb = !!process.env.DATABASE_URL || !!process.env.POSTGRES_URL;
 
-  const response = await fetch(url, {
-    headers: { AccessKey: apiKey },
-    signal: controller.signal,
+export async function reserveWebhookEvent(eventId: string): Promise<boolean> {
+  if (hasDb) {
+    // PostgreSQL: INSERT mit ON CONFLICT DO NOTHING
+    const inserted = await sql`
+      INSERT INTO webhook_events (event_id) VALUES (${eventId})
+      ON CONFLICT DO NOTHING
+      RETURNING event_id
+    `;
+    return (inserted.rowCount ?? 0) > 0;
+  }
+
+  // File-basiert mit Mutex für Thread-Safety
+  return withLock("webhook-file", async () => {
+    const data = readFileStore();
+    if (data[eventId]) return false;  // Bereits verarbeitet
+    data[eventId] = { eventId, processed: false, createdAt: new Date().toISOString() };
+    writeFileStore(data);
+    return true;
   });
-
-  return await response.json();
-}
-
-// Batch-Abruf mit Rate-Limiting
-export async function getVideosMetaBatch(videos, options) {
-  const { rateLimit = 10, maxRetries = 3, retryDelay = 1000 } = options;
-  // Exponential Backoff bei Fehlern
-  // Rate-Limiting zwischen Requests
 }
 ```
 
 **Konzepte**:
-- Timeout-Handling
-- Exponential Backoff
-- Rate-Limiting
-- Batch-Verarbeitung
+- Idempotenz durch Event-ID Deduplizierung
+- Dual-Storage Pattern (DB/File Fallback)
+- Mutex für Thread-Safety bei File-Operationen
+- Atomare Writes (tmp → rename)
+
+### 4. Rate-Limiting
+
+**Datei**: `src/libs/rateLimit.ts`
+
+```typescript
+// Fixed-Window Rate Limiter mit optionalem Postgres-Backend
+export async function checkRateLimit(options: {
+  key: string;
+  limit: number;
+  windowMs: number;
+}): Promise<RateLimitResult> {
+  if (hasDb) {
+    return await checkDbLimit(key, limit, windowMs);  // Persistent über Restarts
+  }
+  return checkMemoryLimit(key, limit, windowMs);  // In-Memory für Dev
+}
+```
+
+**Konzepte**:
+- Fixed-Window Algorithmus
+- Graceful Degradation (DB → Memory Fallback)
+- Schutz vor API-Missbrauch
 
 ---
 
@@ -198,33 +227,70 @@ export async function getVideosMetaBatch(videos, options) {
 
 | Pattern | Beschreibung | Implementierung |
 |---------|--------------|-----------------|
-| **Request/Response** | Synchrone Kommunikation | Alle REST-API-Calls |
-| **Webhook/Callback** | Asynchrone Event-Benachrichtigung | Stripe Webhook |
-| **Token-Auth** | Zustandslose Authentifizierung | JWT mit Cookie |
+| **Request/Response** | Synchrone Kommunikation | Stripe Checkout API |
+| **Webhook/Callback** | Asynchrone Event-Benachrichtigung | Stripe → Server |
 | **Idempotenz** | Mehrfachausführung verhindern | `webhookStore.ts` |
-| **Circuit Breaker** | Fehlertoleranz bei Ausfällen | Timeout + Retry |
 | **Rate Limiting** | API-Überlastung verhindern | `rateLimit.ts` |
-
-### CAP-Theorem Betrachtung
-
-Die Anwendung priorisiert:
-- **Consistency**: JWT garantiert konsistente Auth-Zustände
-- **Availability**: Fallback-Mechanismen (File → DB)
-- **Partition Tolerance**: Webhook-Retry bei Netzwerkfehlern
+| **Mutex** | Thread-Safety bei File-Ops | `mutex.ts` |
 
 ### Fehlerbehandlung
 
+| HTTP Status | Bedeutung | Stripe Reaktion |
+|-------------|-----------|-----------------|
+| **200 OK** | Erfolgreich verarbeitet | Kein Retry |
+| **400 Bad Request** | Ungültige Signatur | Kein Retry |
+| **500 Internal Error** | Transient Failure | Automatischer Retry |
+
 ```typescript
-// Beispiel: Graceful Degradation
+// Error Handling im Webhook
 try {
-  const meta = await getVideoMeta(libraryId, guid);
-} catch (error) {
-  if (error.name === "AbortError") {
-    console.error(`Timeout nach ${timeout}ms`);
-  }
-  return null; // Fallback statt Crash
+  await sendEmail({ to, subject, html });
+  await markWebhookProcessed(event.id);
+} catch (err) {
+  await releaseWebhookReservation(event.id);  // Für Retry freigeben
+  throw err;  // 500 → Stripe wiederholt
 }
 ```
+
+---
+
+## Quellcode-Struktur
+
+### Enthaltene Dateien
+
+```
+src/
+├── app/api/
+│   ├── stripe/create-checkout/
+│   │   └── route.ts              # Checkout-Session erstellen
+│   └── webhook/stripe/
+│       └── route.ts              # Webhook-Handler (Hauptbeispiel)
+├── libs/
+│   ├── stripe.ts                 # Stripe SDK Wrapper
+│   ├── webhookStore.ts           # Idempotenz-Speicher
+│   ├── resend.ts                 # Email-Client
+│   ├── rateLimit.ts              # Rate-Limiting
+│   ├── mutex.ts                  # Async Mutex
+│   ├── logger.ts                 # Structured Logging
+│   └── requestIp.ts              # IP-Extraktion
+├── emails/
+│   └── welcome.ts                # Email-Template
+├── types/
+│   ├── products.ts               # Produkt-Typen
+│   └── config.ts                 # Config-Interface
+└── config.ts                     # App-Konfiguration
+```
+
+### Datei-Übersicht
+
+| Datei | Zeilen | Beschreibung |
+|-------|--------|--------------|
+| `webhook/stripe/route.ts` | 135 | **Hauptbeispiel**: Webhook mit Signatur, Idempotenz, Email |
+| `create-checkout/route.ts` | 129 | Checkout mit Rate-Limit, Validation, URL-Whitelist |
+| `webhookStore.ts` | 142 | Idempotenz mit DB/File Dual-Storage |
+| `rateLimit.ts` | 115 | Fixed-Window Rate Limiter |
+| `stripe.ts` | 115 | Stripe SDK Integration |
+| `mutex.ts` | 37 | Async Mutex für File-Locking |
 
 ---
 
@@ -233,46 +299,31 @@ try {
 ### Voraussetzungen
 
 - Node.js >= 18
-- npm oder yarn
+- npm
 
 ### Setup
 
 ```bash
 # Repository klonen
-git clone <repository-url>
-cd die-produktivitaets-werkstatt
+git clone https://github.com/codeme-ne/esa-verteilte-systeme.git
+cd esa-verteilte-systeme
 
-# Dependencies installieren
-npm install
-
-# Environment-Variablen konfigurieren
-cp .env.local.example .env.local
-# Dann .env.local editieren (siehe unten)
-
-# Development-Server starten
-npm run dev
+# Das vollständige Projekt (mit allen Dependencies) finden Sie unter:
+# https://github.com/codeme-ne/die-produktivitaets-werkstatt
 ```
 
 ### Erforderliche Environment-Variablen
 
 ```bash
-# Authentifizierung
-JWT_SECRET=<mindestens-32-zeichen>
-
 # Stripe (Payment)
 STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
-STRIPE_PRICE_ID_LIVE_EUR=price_...
 
 # Resend (Email)
 RESEND_API_KEY=re_...
 
-# Bunny.net (Video)
-BUNNY_STREAM_LIBRARY_ID=<library-id>
-BUNNY_STREAM_ACCESS_KEY=<access-key>
-
-# Site URL
-NEXT_PUBLIC_SITE_URL=http://localhost:3000
+# Optional: PostgreSQL für Produktion
+DATABASE_URL=postgres://...
 ```
 
 ### Testen des Payment-Flows
@@ -284,59 +335,20 @@ NEXT_PUBLIC_SITE_URL=http://localhost:3000
 
 ---
 
-## Quellcode-Struktur
-
-### Relevante Dateien für "Verteilte Systeme"
-
-```
-app/api/
-├── stripe/
-│   └── create-checkout/route.ts    # Stripe Session erstellen
-├── webhook/
-│   └── stripe/route.ts             # Webhook-Handler (Hauptbeispiel!)
-├── auth/
-│   └── magic-link/route.ts         # Magic-Link Authentifizierung
-├── bunny/
-│   └── videos/route.ts             # Video-Management API
-└── progress/route.ts               # Progress-Tracking API
-
-libs/
-├── stripe.ts                       # Stripe SDK Wrapper
-├── resend.ts                       # Email-Client
-├── bunnyStream.ts                  # Bunny.net REST-Client
-├── jwt.ts                          # JWT Sign/Verify
-├── webhookStore.ts                 # Idempotenz-Speicher
-└── rateLimit.ts                    # Rate-Limiting
-
-middleware.ts                       # Auth-Middleware
-```
-
-### Wichtigste Code-Dateien
-
-| Datei | Zeilen | Beschreibung |
-|-------|--------|--------------|
-| `app/api/webhook/stripe/route.ts` | ~120 | **Hauptbeispiel**: Webhook-Handler mit Signatur-Verifizierung, Idempotenz, Email-Versand |
-| `libs/stripe.ts` | ~85 | Stripe SDK Integration mit Price-Lookup |
-| `libs/bunnyStream.ts` | ~180 | Video-API mit Batch, Retry, Rate-Limiting |
-| `libs/resend.ts` | ~30 | Email-Versand-Abstraktion |
-| `libs/jwt.ts` | ~70 | Token-basierte Authentifizierung |
-
----
-
 ## Fazit
 
-Dieses Projekt demonstriert zentrale Konzepte verteilter Systeme in einer produktionsnahen Anwendung:
+Dieses Projekt demonstriert zentrale Konzepte verteilter Systeme:
 
-1. **Service-Integration**: Drei externe APIs (Stripe, Bunny, Resend)
+1. **Service-Integration**: Stripe + Resend APIs
 2. **Asynchrone Kommunikation**: Webhook-basierter Payment-Flow
-3. **Fehlertoleranz**: Retry, Timeout, Rate-Limiting
-4. **Sicherheit**: JWT-Auth, Webhook-Signaturen
-5. **Idempotenz**: Event-Deduplizierung
+3. **Fehlertoleranz**: Retry-Mechanismen, Graceful Degradation
+4. **Idempotenz**: Event-Deduplizierung mit Dual-Storage
+5. **Sicherheit**: HMAC-Signaturen, Rate-Limiting
 
-Die gewählte Teilfunktionalität (Stripe Payment + Webhook + Email) zeigt besonders gut, wie moderne Web-Anwendungen mehrere verteilte Services orchestrieren.
+Die gewählte Teilfunktionalität (Stripe Payment + Webhook + Email) zeigt, wie moderne Web-Anwendungen mehrere verteilte Services orchestrieren.
 
 ---
 
 **Autor**: Lukasz Angerl
 **Datum**: Januar 2026
-**Lizenz**: Privat (Hochschul-Abgabe)
+**Repository**: https://github.com/codeme-ne/esa-verteilte-systeme
