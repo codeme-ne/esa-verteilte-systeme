@@ -1,0 +1,167 @@
+================================================================================
+MERMAID DIAGRAMME FÜR ESA - VERTEILTE SYSTEME
+================================================================================
+
+Kopiere diese Diagramme auf https://mermaid.live und exportiere als SVG.
+
+================================================================================
+1. GENERELLE ARCHITEKTUR (Übersichtlich & Einfach)
+================================================================================
+
+flowchart LR
+    subgraph Client
+        Browser[Browser]
+    end
+
+    subgraph Server[Next.js Server]
+        API[API Routes]
+    end
+
+    subgraph Services[Externe Services]
+        Stripe[Stripe]
+        Bunny[Bunny CDN]
+        Resend[Resend]
+    end
+
+    subgraph Data[Daten]
+        DB[(Storage)]
+    end
+
+    Browser <-->|REST/JSON| API
+    API <-->|Payment| Stripe
+    API <-->|Video| Bunny
+    API -->|Email| Resend
+    API <--> DB
+    Browser -.->|Stream| Bunny
+
+    style Stripe fill:#635bff,color:#fff
+    style Bunny fill:#ff6600,color:#fff
+    style Resend fill:#000,color:#fff
+
+
+================================================================================
+2. STRIPE PAYMENT FLOW (Fokus für ESA)
+================================================================================
+
+sequenceDiagram
+    participant C as Browser
+    participant S as Next.js Server
+    participant ST as Stripe API
+    participant R as Resend Email
+
+    Note over C,R: 1. Checkout-Prozess (Synchron)
+    C->>S: POST /api/stripe/create-checkout
+    S->>ST: Create Checkout Session
+    ST-->>S: Session URL
+    S-->>C: Redirect URL
+    C->>ST: User bezahlt bei Stripe
+
+    Note over C,R: 2. Webhook-Verarbeitung (Asynchron)
+    ST--)S: POST /api/webhook/stripe
+    Note right of S: Signatur prüfen
+    Note right of S: Idempotenz prüfen
+    S->>R: Welcome Email senden
+    R-->>S: OK
+    S-->>ST: 200 OK
+
+
+================================================================================
+3. STRIPE PAYMENT FLOW (Flowchart-Version)
+================================================================================
+
+flowchart TB
+    subgraph Sync[Synchroner Flow]
+        A[Browser] -->|1. POST /api/stripe/create-checkout| B[Next.js API]
+        B -->|2. Create Session| C[Stripe API]
+        C -->|3. Session URL| B
+        B -->|4. Redirect| A
+        A -->|5. Bezahlung| C
+    end
+
+    subgraph Async[Asynchroner Flow - Webhook]
+        C -.->|6. POST Webhook| D[Webhook Handler]
+        D -->|7. Verify Signature| D
+        D -->|8. Check Idempotenz| D
+        D -->|9. Send Email| E[Resend API]
+        E -.->|10. Email| F[Kunde]
+    end
+
+    style C fill:#635bff,color:#fff
+    style E fill:#000,color:#fff
+    style D fill:#ffcc00,color:#000
+
+
+================================================================================
+4. DATENFLUSS ÜBERSICHT (Einfach)
+================================================================================
+
+flowchart TB
+    subgraph Frontend
+        UI[React App]
+    end
+
+    subgraph Backend[Next.js Backend]
+        Auth[Auth API]
+        Pay[Payment API]
+        Vid[Video API]
+        Prog[Progress API]
+    end
+
+    subgraph External[Externe Systeme]
+        Stripe[Stripe]
+        Bunny[Bunny.net]
+        Resend[Resend]
+    end
+
+    subgraph Storage
+        JWT[JWT Token]
+        File[(File Storage)]
+    end
+
+    UI --> Auth
+    UI --> Pay
+    UI --> Vid
+    UI --> Prog
+
+    Auth --> Resend
+    Auth --> JWT
+    Pay --> Stripe
+    Vid --> Bunny
+    Prog --> File
+
+    Stripe -.->|Webhook| Pay
+
+    style Stripe fill:#635bff,color:#fff
+    style Bunny fill:#ff6600,color:#fff
+    style Resend fill:#000,color:#fff
+
+
+================================================================================
+5. VERTEILTE KOMPONENTEN (Für Theorie-Teil)
+================================================================================
+
+flowchart TB
+    subgraph Lokal[Lokales System]
+        Client[Client Browser]
+        Server[Next.js Server]
+        Store[(Lokaler Storage)]
+    end
+
+    subgraph Verteilt[Verteilte Systeme]
+        Stripe[Stripe API<br/>San Francisco]
+        Bunny[Bunny CDN<br/>Global Edge]
+        Resend[Resend API<br/>Cloud]
+    end
+
+    Client <-->|HTTPS| Server
+    Server <-->|REST API| Stripe
+    Server <-->|REST API| Bunny
+    Server -->|REST API| Resend
+    Client -.->|Video Stream| Bunny
+    Server --> Store
+
+    style Stripe fill:#635bff,color:#fff
+    style Bunny fill:#ff6600,color:#fff
+    style Resend fill:#000,color:#fff
+
+================================================================================
